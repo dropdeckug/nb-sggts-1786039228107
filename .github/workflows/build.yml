@@ -1,0 +1,155 @@
+name: Phase 1 - Setup
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  CI: "true"
+  NB_WEB_DIR: "dist"
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Phase 1 - Set up Node.js 20"
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: "Phase 1 - Set up JDK 21"
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: "temurin"
+      - name: "Phase 1 - Extract source code"
+        run: |
+          unzip -o source.zip -d project-src
+          node -e "const fs=require('fs'),path=require('path');function walk(d,depth,out){if(depth>3||!fs.existsSync(d))return;for(const e of fs.readdirSync(d,{withFileTypes:true})){if(e.name==='node_modules'||e.name.startsWith('.'))continue;const p=path.join(d,e.name);if(e.isDirectory())walk(p,depth+1,out);}if(fs.existsSync(path.join(d,'package.json')))out.push(d);}const c=[];walk('project-src',0,c);function s(p){try{const j=JSON.parse(fs.readFileSync(path.join(p,'package.json'),'utf8'));const d={...j.dependencies,...j.devDependencies};let x=0;if(d['@capacitor/core'])x+=100;if(j.scripts&&j.scripts.build)x+=50;if(d.vite||d.next||d['react-scripts']||d['@angular/core']||d.nuxt||d.svelte)x+=20;if(Array.isArray(j.workspaces))x-=200;return x-p.split('/').length;}catch(e){return -999;}}c.sort((a,b)=>s(b)-s(a));console.log(c[0]||'');" > .pr.txt
+          PROJECT_ROOT=$(cat .pr.txt); rm -f .pr.txt
+          if [ -z "$PROJECT_ROOT" ]; then
+            STATIC_ROOT=$(find project-src -maxdepth 3 -name "index.html" -not -path "*/node_modules/*" -exec dirname {} \; | head -1)
+            if [ -z "$STATIC_ROOT" ]; then echo "No package.json AND no index.html in source.zip"; exit 1; fi
+            PROJECT_ROOT="$STATIC_ROOT"
+            echo "Static HTML detected → synthesizing package.json at $PROJECT_ROOT"
+            cat > "$PROJECT_ROOT/package.json" <<'STATICPKG'
+          {"name":"static-html-app","version":"1.0.0","private":true,"scripts":{"build":"node -e "const fs=require('fs'),path=require('path');fs.mkdirSync('dist',{recursive:true});function cp(s,d){for(const e of fs.readdirSync(s,{withFileTypes:true})){if(e.name==='node_modules'||e.name==='dist'||e.name==='android'||e.name==='ios'||e.name.startsWith('.'))continue;const sp=path.join(s,e.name),dp=path.join(d,e.name);if(e.isDirectory()){fs.mkdirSync(dp,{recursive:true});cp(sp,dp);}else fs.copyFileSync(sp,dp);}}cp('.','dist');console.log('static copy → dist');""}}
+          STATICPKG
+          fi
+          shopt -s dotglob
+          cp -r "$PROJECT_ROOT"/* ./ 2>/dev/null || true
+          shopt -u dotglob
+          rm -rf project-src source.zip
+          rm -f capacitor.config.ts capacitor.config.js capacitor.config.json
+
+      - name: "Phase 1 - Install npm dependencies"
+        run: |
+          rm -f bun.lockb bun.lock yarn.lock pnpm-lock.yaml
+          npm install --legacy-peer-deps
+      - name: "Phase 1 - Install Capacitor + Android platform"
+        run: |
+          CAP_VERSION=$(node -e "try{const p=require('./package.json');console.log((p.dependencies&&p.dependencies['@capacitor/core'])||(p.devDependencies&&p.devDependencies['@capacitor/core'])||'6.2.0')}catch(e){console.log('6.2.0')}" | sed 's/[\^~>=<]//g')
+          npm install @capacitor/core@$CAP_VERSION @capacitor/cli@$CAP_VERSION @capacitor/android@$CAP_VERSION --legacy-peer-deps
+          # Build web output (best-effort) so cap add android does not complain
+          if ! npm run build 2>/dev/null; then
+            mkdir -p dist
+            [ -f dist/index.html ] || echo "<!DOCTYPE html><html><body></body></html>" > dist/index.html
+          fi
+          rm -f capacitor.config.ts capacitor.config.js capacitor.config.json
+          npx cap init "sggts" "com.nativebridge.app" --web-dir "dist" || true
+          npx cap add android || echo "cap add android may have failed (will retry in Phase 2)"
+
+      - name: Install Capacitor plugins
+        run: |
+          echo "=== Installing 2 Capacitor plugin(s) ==="
+          : > plugin-install-report.txt
+          echo ">>> @capacitor/status-bar"
+          if npm install "@capacitor/status-bar" --legacy-peer-deps --save 2>&1 | tee -a plugin-install.log; then
+            echo "OK @capacitor/status-bar" >> plugin-install-report.txt
+          else
+            echo "Retrying @capacitor/status-bar..."; sleep 2;
+            if npm install "@capacitor/status-bar" --legacy-peer-deps --save 2>&1 | tee -a plugin-install.log; then
+              echo "OK @capacitor/status-bar" >> plugin-install-report.txt
+            else
+              echo "FAIL @capacitor/status-bar" >> plugin-install-report.txt
+            fi
+          fi
+          echo ">>> @capacitor/app"
+          if npm install "@capacitor/app" --legacy-peer-deps --save 2>&1 | tee -a plugin-install.log; then
+            echo "OK @capacitor/app" >> plugin-install-report.txt
+          else
+            echo "Retrying @capacitor/app..."; sleep 2;
+            if npm install "@capacitor/app" --legacy-peer-deps --save 2>&1 | tee -a plugin-install.log; then
+              echo "OK @capacitor/app" >> plugin-install-report.txt
+            else
+              echo "FAIL @capacitor/app" >> plugin-install-report.txt
+            fi
+          fi
+          echo "=== Plugin install report ==="
+          cat plugin-install-report.txt
+          # Verify each plugin actually landed in package.json — fail loudly otherwise
+          MISSING=""
+          node -e "const p=require('./package.json');const d={...(p.dependencies||{}),...(p.devDependencies||{})};process.exit(d['@capacitor/status-bar']?0:1)" || MISSING="$MISSING @capacitor/status-bar"
+          node -e "const p=require('./package.json');const d={...(p.dependencies||{}),...(p.devDependencies||{})};process.exit(d['@capacitor/app']?0:1)" || MISSING="$MISSING @capacitor/app"
+          if [ -n "$MISSING" ]; then echo "ERROR: plugins missing from package.json after install:$MISSING"; echo "MISSING_FROM_PKG:$MISSING" >> plugin-install-report.txt; fi
+          npx cap sync android || echo 'cap sync warning (non-fatal in Phase 1)'
+          echo "=== Plugins synced ==="
+
+      - name: "Phase 1 - Generate manifest"
+        run: |
+          cat > /tmp/gen-manifest.cjs <<'GENMANIFEST'
+          const fs = require('fs');
+          const path = require('path');
+          const p = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8'));
+          const deps = { ...(p.dependencies || {}), ...(p.devDependencies || {}) };
+          let report = '';
+          try { report = fs.readFileSync('plugin-install-report.txt', 'utf8'); } catch (e) {}
+          const reportLines = report.split('\n').filter(Boolean);
+          const pluginsInstalled = reportLines.filter(l => l.startsWith('OK ')).map(l => l.slice(3).trim());
+          const pluginsFailed    = reportLines.filter(l => l.startsWith('FAIL ')).map(l => l.slice(5).trim());
+          const pluginsSkipped   = reportLines.filter(l => l.startsWith('SKIP ')).map(l => l.slice(5).trim());
+          const m = {
+            appRoot: './',
+            installedDeps: Object.keys(p.dependencies || {}).map(k => k + '@' + p.dependencies[k]),
+            installedDevDeps: Object.keys(p.devDependencies || {}).map(k => k + '@' + p.devDependencies[k]),
+            plugins: Object.keys(deps).filter(k => k.startsWith('@capacitor/') || k.startsWith('capacitor-') || k.startsWith('@capawesome/') || k.includes('cordova-plugin')),
+            pluginsInstalled, pluginsFailed, pluginsSkipped,
+            hasAndroidFolder: fs.existsSync('android'),
+            buildOutputDir: fs.existsSync('dist') ? 'dist' : (fs.existsSync('build') ? 'build' : 'dist'),
+          };
+          fs.writeFileSync('phase1-manifest.json', JSON.stringify(m, null, 2));
+          console.log(JSON.stringify(m, null, 2));
+          GENMANIFEST
+          node /tmp/gen-manifest.cjs
+      - name: "Phase 1 - Bundle source artifact"
+        run: |
+          mkdir -p phase1-out
+          cp package.json phase1-out/ 2>/dev/null || true
+          cp package-lock.json phase1-out/ 2>/dev/null || true
+          cp capacitor.config.json phase1-out/ 2>/dev/null || true
+          cp capacitor.config.ts phase1-out/ 2>/dev/null || true
+          cp phase1-manifest.json phase1-out/ 2>/dev/null || true
+          cp plugin-install-report.txt phase1-out/ 2>/dev/null || true
+          if [ -d android ]; then cp -r android phase1-out/android; fi
+          cd phase1-out && zip -r ../phase1-source.zip . > /dev/null && cd ..
+          ls -la phase1-source.zip
+      - name: "Phase 1 - Cache npm"
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: |
+            ~/.npm
+            node_modules
+          key: npm-setup-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+      - name: "Phase 1 - Report installed"
+        run: |
+          echo "=== SETUP_COMPLETE ==="
+          npm ls --depth=0 2>/dev/null | tail -30
+      - name: "Phase 1 - Upload source artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase1-source
+          path: phase1-source.zip
+          retention-days: 1
+# build-nonce: 6b1d4b5d-04de-4969-8019-891b637933ca
